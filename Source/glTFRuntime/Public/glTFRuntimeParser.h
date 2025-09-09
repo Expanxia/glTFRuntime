@@ -1848,6 +1848,10 @@ struct FglTFRuntimeStaticMeshContext : public FGCObject
 	TMap<int32, int32> ContextLODsMap;
 
 	const int32 MeshIndex;
+	
+	// Binary fingerprint for improved caching based on actual mesh geometry data
+	FString BinaryFingerprint;
+	bool IsCachedMesh = false;
 
 	FglTFRuntimeStaticMeshContext(TSharedRef<FglTFRuntimeParser> InParser, const int32 InMeshIndex, const FglTFRuntimeStaticMeshConfig& InStaticMeshConfig);
 
@@ -2010,6 +2014,7 @@ struct FglTFRuntimeMaterial
 	UTexture2D* BaseColorTextureCache;
 	FglTFRuntimeTextureTransform BaseColorTransform;
 	FglTFRuntimeTextureSampler BaseColorSampler;
+	FString BaseColorTextureURI;
 
 	bool bHasMetallicFactor;
 	double MetallicFactor;
@@ -2020,16 +2025,19 @@ struct FglTFRuntimeMaterial
 	UTexture2D* MetallicRoughnessTextureCache;
 	FglTFRuntimeTextureTransform MetallicRoughnessTransform;
 	FglTFRuntimeTextureSampler MetallicRoughnessSampler;
+	FString MetallicRoughnessTextureURI;
 
 	TArray<FglTFRuntimeMipMap> NormalTextureMips;
 	UTexture2D* NormalTextureCache;
 	FglTFRuntimeTextureTransform NormalTransform;
 	FglTFRuntimeTextureSampler NormalSampler;
+	FString NormalTextureURI;
 
 	TArray<FglTFRuntimeMipMap> OcclusionTextureMips;
 	UTexture2D* OcclusionTextureCache;
 	FglTFRuntimeTextureTransform OcclusionTransform;
 	FglTFRuntimeTextureSampler OcclusionSampler;
+	FString OcclusionTextureURI;
 
 	bool bHasEmissiveFactor;
 	FLinearColor EmissiveFactor;
@@ -2038,6 +2046,7 @@ struct FglTFRuntimeMaterial
 	UTexture2D* EmissiveTextureCache;
 	FglTFRuntimeTextureTransform EmissiveTransform;
 	FglTFRuntimeTextureSampler EmissiveSampler;
+	FString EmissiveTextureURI;
 
 	bool bHasSpecularFactor;
 	FLinearColor SpecularFactor;
@@ -2049,6 +2058,7 @@ struct FglTFRuntimeMaterial
 	UTexture2D* SpecularGlossinessTextureCache;
 	FglTFRuntimeTextureTransform SpecularGlossinessTransform;
 	FglTFRuntimeTextureSampler SpecularGlossinessSampler;
+	FString SpecularGlossinessTextureURI;
 
 	bool bKHR_materials_specular;
 	double BaseSpecularFactor;
@@ -2056,6 +2066,7 @@ struct FglTFRuntimeMaterial
 	UTexture2D* SpecularTextureCache;
 	FglTFRuntimeTextureTransform SpecularTransform;
 	FglTFRuntimeTextureSampler SpecularSampler;
+	FString SpecularTextureURI;
 
 	bool bHasDiffuseFactor;
 	FLinearColor DiffuseFactor;
@@ -2064,6 +2075,7 @@ struct FglTFRuntimeMaterial
 	UTexture2D* DiffuseTextureCache;
 	FglTFRuntimeTextureTransform DiffuseTransform;
 	FglTFRuntimeTextureSampler DiffuseSampler;
+	FString DiffuseTextureURI;
 
 	bool bKHR_materials_pbrSpecularGlossiness;
 	double NormalTextureScale;
@@ -2075,6 +2087,7 @@ struct FglTFRuntimeMaterial
 	UTexture2D* TransmissionTextureCache;
 	FglTFRuntimeTextureTransform TransmissionTransform;
 	FglTFRuntimeTextureSampler TransmissionSampler;
+	FString TransmissionTextureURI;
 
 	bool bMasked;
 
@@ -2097,6 +2110,7 @@ struct FglTFRuntimeMaterial
 	UTexture2D* ThicknessTextureCache;
 	FglTFRuntimeTextureTransform ThicknessTransform;
 	FglTFRuntimeTextureSampler ThicknessSampler;
+	FString ThicknessTextureURI;
 	double AttenuationDistance;
 	FLinearColor AttenuationColor;
 
@@ -2104,16 +2118,19 @@ struct FglTFRuntimeMaterial
 	UTexture2D* ClearCoatTextureCache;
 	FglTFRuntimeTextureTransform ClearCoatTextureTransform;
 	FglTFRuntimeTextureSampler ClearCoatTextureSampler;
+	FString ClearCoatTextureURI;
 
 	TArray<FglTFRuntimeMipMap> ClearCoatRoughnessTextureMips;
 	UTexture2D* ClearCoatRoughnessTextureCache;
 	FglTFRuntimeTextureTransform ClearCoatRoughnessTextureTransform;
 	FglTFRuntimeTextureSampler ClearCoatRoughnessTextureSampler;
+	FString ClearCoatRoughnessTextureURI;
 
 	TArray<FglTFRuntimeMipMap> ClearCoatNormalTextureMips;
 	UTexture2D* ClearCoatNormalTextureCache;
 	FglTFRuntimeTextureTransform ClearCoatNormalTextureTransform;
 	FglTFRuntimeTextureSampler ClearCoatNormalTextureSampler;
+	FString ClearCoatNormalTextureURI;
 
 	bool bKHR_materials_sheen;
 	FLinearColor SheenColorFactor;
@@ -2122,11 +2139,12 @@ struct FglTFRuntimeMaterial
 	UTexture2D* SheenColorTextureCache;
 	FglTFRuntimeTextureTransform SheenColorTextureTransform;
 	FglTFRuntimeTextureSampler SheenColorTextureSampler;
+	FString SheenColorTextureURI;
 	TArray<FglTFRuntimeMipMap> SheenRoughnessTextureMips;
 	UTexture2D* SheenRoughnessTextureCache;
 	FglTFRuntimeTextureTransform SheenRoughnessTextureTransform;
 	FglTFRuntimeTextureSampler SheenRoughnessTextureSampler;
-
+	FString SheenRoughnessTextureURI;
 
 	FglTFRuntimeMaterial()
 	{
@@ -2380,7 +2398,7 @@ public:
 	UStaticMesh* LoadStaticMeshByName(const FString MeshName, const FglTFRuntimeStaticMeshConfig& StaticMeshConfig);
 
 	UMaterialInterface* LoadMaterial(const int32 MaterialIndex, const FglTFRuntimeMaterialsConfig& MaterialsConfig, const bool bUseVertexColors, FString& MaterialName, UMaterialInterface* ForceBaseMaterial);
-	UTexture2D* LoadTexture(const int32 TextureIndex, TArray<FglTFRuntimeMipMap>& Mips, const bool sRGB, const FglTFRuntimeMaterialsConfig& MaterialsConfig, FglTFRuntimeTextureSampler& Sampler);
+	UTexture2D* LoadTexture(const int32 TextureIndex, TArray<FglTFRuntimeMipMap>& Mips, const bool sRGB, const FglTFRuntimeMaterialsConfig& MaterialsConfig, FglTFRuntimeTextureSampler& Sampler, FString& TextureURI);
 
 	bool LoadNodes();
 	bool LoadNode(const int32 NodeIndex, FglTFRuntimeNode& Node);

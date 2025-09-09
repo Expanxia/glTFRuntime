@@ -1,6 +1,7 @@
 // Copyright 2020-2022, Roberto De Ioris.
 
 #include "glTFRuntimeParser.h"
+#include "glTFRuntimeCacheSubsystem.h"
 #include "MeshDescription.h"
 #include "StaticMeshAttributes.h"
 #include "StaticMeshOperations.h"
@@ -63,7 +64,7 @@ FglTFRuntimeStaticMeshContext::FglTFRuntimeStaticMeshContext(TSharedRef<FglTFRun
 
 void FglTFRuntimeParser::LoadStaticMeshAsync(const int32 MeshIndex, const FglTFRuntimeStaticMeshAsync& AsyncCallback, const FglTFRuntimeStaticMeshConfig& StaticMeshConfig)
 {
-	// first check cache
+	// first check local cache
 	if (CanReadFromCache(StaticMeshConfig.CacheMode) && StaticMeshesCache.Contains(MeshIndex))
 	{
 		UStaticMesh* StaticMesh = StaticMeshesCache[MeshIndex];
@@ -72,6 +73,32 @@ void FglTFRuntimeParser::LoadStaticMeshAsync(const int32 MeshIndex, const FglTFR
 				AsyncCallback.ExecuteIfBound(StaticMesh);
 			}, TStatId(), nullptr, ENamedThreads::GameThread);
 		return;
+	}
+
+	// Check global cache
+	TSharedPtr<FJsonObject> JsonMeshObject = GetJsonObjectFromRootIndex("meshes", MeshIndex);
+	if (JsonMeshObject)
+	{
+		if (UglTFRuntimeCacheSubsystem* Cache = UglTFRuntimeCacheSubsystem::Get())
+		{
+			const FString MeshFingerprint = Cache->GenerateMeshFingerprint(JsonMeshObject, StaticMeshConfig);
+			if (!MeshFingerprint.IsEmpty())
+			{
+				if (UStaticMesh* CachedMesh = Cache->GetCachedMesh(MeshFingerprint))
+				{
+					UE_LOG(LogGLTFRuntime, Log, TEXT("Using globally cached static mesh for async load MeshIndex %d: %s"), MeshIndex, *MeshFingerprint);
+					FGraphEventRef Task = FFunctionGraphTask::CreateAndDispatchWhenReady([CachedMesh, AsyncCallback]()
+						{
+							AsyncCallback.ExecuteIfBound(CachedMesh);
+						}, TStatId(), nullptr, ENamedThreads::GameThread);
+					return;
+				}
+			}
+		}
+		else
+		{
+			UE_LOG(LogGLTFRuntime, Warning, TEXT("Unable to get UglTFRuntimeCacheSubsystem"));
+		}
 	}
 
 	TSharedRef<FglTFRuntimeStaticMeshContext, ESPMode::ThreadSafe> StaticMeshContext = MakeShared<FglTFRuntimeStaticMeshContext, ESPMode::ThreadSafe>(AsShared(), MeshIndex, StaticMeshConfig);
@@ -94,11 +121,27 @@ void FglTFRuntimeParser::LoadStaticMeshAsync(const int32 MeshIndex, const FglTFR
 				{
 					if (StaticMeshContext->StaticMesh)
 					{
-						StaticMeshContext->StaticMesh = StaticMeshContext->Parser->FinalizeStaticMesh(StaticMeshContext);
-					}
+						if (!StaticMeshContext->IsCachedMesh)
+						{
+							StaticMeshContext->StaticMesh = StaticMeshContext->Parser->FinalizeStaticMesh(StaticMeshContext);
 
-					if (StaticMeshContext->StaticMesh)
-					{
+							// Add to global cache first using binary fingerprint if available
+							if (!StaticMeshContext->BinaryFingerprint.IsEmpty())
+							{
+								if (UglTFRuntimeCacheSubsystem* Cache = UglTFRuntimeCacheSubsystem::Get())
+								{
+									Cache->AddCachedMesh(StaticMeshContext->BinaryFingerprint, StaticMeshContext->StaticMesh);
+									UE_LOG(LogGLTFRuntime, Log, TEXT("Cached static mesh with binary fingerprint (async): %s"), *StaticMeshContext->BinaryFingerprint);
+								}
+								else
+								{
+									UE_LOG(LogGLTFRuntime, Warning, TEXT("Unable to get UglTFRuntimeCacheSubsystem"));
+								}
+
+							}
+						}
+
+						// Add to local cache as well for compatibility
 						if (StaticMeshContext->Parser->CanWriteToCache(StaticMeshContext->StaticMeshConfig.CacheMode))
 						{
 							StaticMeshContext->Parser->StaticMeshesCache.Add(MeshIndex, StaticMeshContext->StaticMesh);
@@ -920,6 +963,37 @@ UStaticMesh* FglTFRuntimeParser::LoadStaticMesh_Internal(TSharedRef<FglTFRuntime
 			}
 #endif
 		}
+
+		// After geometry generation, add binary-based cache check and store
+		// At this point we have StaticMeshBuildVertices and LODIndices available
+		if (CurrentLODIndex == 0) // Only do this for the first LOD to avoid multiple cache operations
+		{
+			if (UglTFRuntimeCacheSubsystem* Cache = UglTFRuntimeCacheSubsystem::Get())
+			{
+				// Generate binary-based fingerprint now that we have the actual geometry data
+				const FString BinaryMeshFingerprint = Cache->GenerateMeshFingerprintFromBinaryData(StaticMeshBuildVertices, LODIndices, StaticMeshConfig);
+				if (!BinaryMeshFingerprint.IsEmpty())
+				{
+					// Check if we already have this mesh cached with binary fingerprint
+					if (UStaticMesh* CachedMesh = Cache->GetCachedMesh(BinaryMeshFingerprint))
+					{
+						UE_LOG(LogGLTFRuntime, Log, TEXT("Using globally cached static mesh with binary fingerprint (post-generation check): %s"), *BinaryMeshFingerprint);
+						// Return the cached mesh and abandon the current build
+						StaticMeshContext->IsCachedMesh = true;
+						return CachedMesh;
+					}
+					else
+					{
+						// Store the binary fingerprint for later use when we store the final mesh
+						StaticMeshContext->BinaryFingerprint = BinaryMeshFingerprint;
+					}
+				}
+			}
+			else
+			{
+				UE_LOG(LogGLTFRuntime, Warning, TEXT("Unable to get UglTFRuntimeCacheSubsystem"));
+			}
+		}
 	}
 
 	OnPostCreatedStaticMesh.Broadcast(StaticMeshContext);
@@ -1144,37 +1218,75 @@ UStaticMesh* FglTFRuntimeParser::LoadStaticMesh(const int32 MeshIndex, const Fgl
 		return nullptr;
 	}
 
-	if (CanReadFromCache(StaticMeshConfig.CacheMode) && StaticMeshesCache.Contains(MeshIndex))
+	if (UglTFRuntimeCacheSubsystem* Cache = UglTFRuntimeCacheSubsystem::Get())
 	{
-		return StaticMeshesCache[MeshIndex];
-	}
+		// Check global cache first
+		const FString MeshFingerprint = Cache->GenerateMeshFingerprint(JsonMeshObject, StaticMeshConfig);
+		if (!MeshFingerprint.IsEmpty())
+		{
+			if (UStaticMesh* CachedMesh = Cache->GetCachedMesh(MeshFingerprint))
+			{
+				UE_LOG(LogGLTFRuntime, Log, TEXT("Using globally cached static mesh for MeshIndex %d: %s"), MeshIndex, *MeshFingerprint);
+				return CachedMesh;
+			}
+		}
 
-	TSharedRef<FglTFRuntimeStaticMeshContext, ESPMode::ThreadSafe> StaticMeshContext = MakeShared<FglTFRuntimeStaticMeshContext, ESPMode::ThreadSafe>(AsShared(), MeshIndex, StaticMeshConfig);
-	FglTFRuntimeMeshLOD* LOD = nullptr;
-	if (!LoadMeshIntoMeshLOD(JsonMeshObject.ToSharedRef(), LOD, StaticMeshConfig.MaterialsConfig))
+		// Check local cache as fallback
+		if (CanReadFromCache(StaticMeshConfig.CacheMode) && StaticMeshesCache.Contains(MeshIndex))
+		{
+			return StaticMeshesCache[MeshIndex];
+		}
+
+		TSharedRef<FglTFRuntimeStaticMeshContext, ESPMode::ThreadSafe> StaticMeshContext = MakeShared<FglTFRuntimeStaticMeshContext, ESPMode::ThreadSafe>(AsShared(), MeshIndex, StaticMeshConfig);
+		FglTFRuntimeMeshLOD* LOD = nullptr;
+		if (!LoadMeshIntoMeshLOD(JsonMeshObject.ToSharedRef(), LOD, StaticMeshConfig.MaterialsConfig))
+		{
+			return nullptr;
+		}
+		StaticMeshContext->LODs.Add(LOD);
+
+		UStaticMesh* StaticMesh = LoadStaticMesh_Internal(StaticMeshContext);
+		if (!StaticMesh)
+		{
+			return nullptr;
+		}
+
+		if (!StaticMeshContext->IsCachedMesh)
+		{
+			StaticMesh = FinalizeStaticMesh(StaticMeshContext);
+			if (!StaticMesh)
+			{
+				return nullptr;
+			}
+
+			// Add to global cache first using binary fingerprint if available, otherwise fall back to JSON-based
+			if (!StaticMeshContext->BinaryFingerprint.IsEmpty())
+			{
+				Cache->AddCachedMesh(StaticMeshContext->BinaryFingerprint, StaticMesh);
+				UE_LOG(LogGLTFRuntime, Log, TEXT("Cached static mesh with binary fingerprint: %s"), *StaticMeshContext->BinaryFingerprint);
+			}
+			else if (!MeshFingerprint.IsEmpty())
+			{
+				// Fallback to JSON-based fingerprinting for compatibility
+				Cache->AddCachedMesh(MeshFingerprint, StaticMesh);
+				UE_LOG(LogGLTFRuntime, Log, TEXT("Cached static mesh with JSON fingerprint (fallback): %s"), *MeshFingerprint);
+			}
+		}
+
+		// Add to local cache as well for compatibility
+		if (CanWriteToCache(StaticMeshConfig.CacheMode))
+		{
+			StaticMeshesCache.Add(MeshIndex, StaticMesh);
+		}
+
+		return StaticMesh;
+	}
+	else
 	{
-		return nullptr;
+		UE_LOG(LogGLTFRuntime, Warning, TEXT("Unable to get UglTFRuntimeCacheSubsystem"));
 	}
-	StaticMeshContext->LODs.Add(LOD);
-
-	UStaticMesh* StaticMesh = LoadStaticMesh_Internal(StaticMeshContext);
-	if (!StaticMesh)
-	{
-		return nullptr;
-	}
-
-	StaticMesh = FinalizeStaticMesh(StaticMeshContext);
-	if (!StaticMesh)
-	{
-		return nullptr;
-	}
-
-	if (CanWriteToCache(StaticMeshConfig.CacheMode))
-	{
-		StaticMeshesCache.Add(MeshIndex, StaticMesh);
-	}
-
-	return StaticMesh;
+	
+	return nullptr;
 }
 
 TArray<UStaticMesh*> FglTFRuntimeParser::LoadStaticMeshesFromPrimitives(const int32 MeshIndex, const FglTFRuntimeStaticMeshConfig& StaticMeshConfig)
@@ -1208,10 +1320,27 @@ TArray<UStaticMesh*> FglTFRuntimeParser::LoadStaticMeshesFromPrimitives(const in
 			break;
 		}
 
-		StaticMesh = FinalizeStaticMesh(StaticMeshContext);
-		if (!StaticMesh)
+		if(!StaticMeshContext->IsCachedMesh)
 		{
-			break;
+			StaticMesh = FinalizeStaticMesh(StaticMeshContext);
+			if (!StaticMesh)
+			{
+				break;
+			}
+
+			// Add to global cache first using binary fingerprint if available, otherwise fall back to JSON-based
+			if (!StaticMeshContext->BinaryFingerprint.IsEmpty())
+			{
+				if (UglTFRuntimeCacheSubsystem* Cache = UglTFRuntimeCacheSubsystem::Get())
+				{
+					Cache->AddCachedMesh(StaticMeshContext->BinaryFingerprint, StaticMesh);
+					UE_LOG(LogGLTFRuntime, Log, TEXT("Cached static mesh with binary fingerprint: %s"), *StaticMeshContext->BinaryFingerprint);
+				}
+				else
+				{
+					UE_LOG(LogGLTFRuntime, Warning, TEXT("Unable to get UglTFRuntimeCacheSubsystem"));
+				}	
+			}
 		}
 
 		StaticMeshes.Add(StaticMesh);
@@ -1246,16 +1375,81 @@ UStaticMesh* FglTFRuntimeParser::LoadStaticMeshLODs(const TArray<int32>& MeshInd
 	UStaticMesh* StaticMesh = LoadStaticMesh_Internal(StaticMeshContext);
 	if (StaticMesh)
 	{
-		return FinalizeStaticMesh(StaticMeshContext);
+		if(!StaticMeshContext->IsCachedMesh)
+		{
+			StaticMesh = FinalizeStaticMesh(StaticMeshContext);
+			// Add to global cache first using binary fingerprint if available, otherwise fall back to JSON-based
+			if (StaticMesh && !StaticMeshContext->BinaryFingerprint.IsEmpty())
+			{
+				if (UglTFRuntimeCacheSubsystem* Cache = UglTFRuntimeCacheSubsystem::Get())
+				{
+					Cache->AddCachedMesh(StaticMeshContext->BinaryFingerprint, StaticMesh);
+					UE_LOG(LogGLTFRuntime, Log, TEXT("Cached static mesh with binary fingerprint: %s"), *StaticMeshContext->BinaryFingerprint);
+				}
+				else
+				{
+					UE_LOG(LogGLTFRuntime, Warning, TEXT("Unable to get UglTFRuntimeCacheSubsystem"));
+				}	
+			}
+		}
+		return StaticMesh;
 	}
 	return nullptr;
 }
 
 void FglTFRuntimeParser::LoadStaticMeshLODsAsync(const TArray<int32>& MeshIndices, const FglTFRuntimeStaticMeshAsync& AsyncCallback, const FglTFRuntimeStaticMeshConfig& StaticMeshConfig)
 {
+	// Check global cache first for multi-LOD mesh
+	FString CombinedFingerprint;
+	TArray<TSharedPtr<FJsonObject>> JsonMeshObjects;
+	bool bCanUseGlobalCache = true;
+	
+	UglTFRuntimeCacheSubsystem* Cache = UglTFRuntimeCacheSubsystem::Get();
+	if(!Cache)
+	{
+		UE_LOG(LogGLTFRuntime, Warning, TEXT("Unable to get UglTFRuntimeCacheSubsystem"));
+	}
+
+	for (const int32 MeshIndex : MeshIndices)
+	{
+		TSharedPtr<FJsonObject> JsonMeshObject = GetJsonObjectFromRootIndex("meshes", MeshIndex);
+		if (JsonMeshObject)
+		{
+			JsonMeshObjects.Add(JsonMeshObject);
+			const FString MeshFingerprint = Cache->GenerateMeshFingerprint(JsonMeshObject, StaticMeshConfig);
+			if (!MeshFingerprint.IsEmpty())
+			{
+				CombinedFingerprint += MeshFingerprint + TEXT("_");
+			}
+			else
+			{
+				bCanUseGlobalCache = false;
+				break;
+			}
+		}
+		else
+		{
+			bCanUseGlobalCache = false;
+			break;
+		}
+	}
+
+	if (bCanUseGlobalCache && !CombinedFingerprint.IsEmpty())
+	{
+		if (UStaticMesh* CachedMesh = Cache->GetCachedMesh(CombinedFingerprint))
+		{
+			UE_LOG(LogGLTFRuntime, Log, TEXT("Using globally cached static mesh for async LODs load: %s"), *CombinedFingerprint);
+			FGraphEventRef Task = FFunctionGraphTask::CreateAndDispatchWhenReady([CachedMesh, AsyncCallback]()
+				{
+					AsyncCallback.ExecuteIfBound(CachedMesh);
+				}, TStatId(), nullptr, ENamedThreads::GameThread);
+			return;
+		}
+	}
+
 	TSharedRef<FglTFRuntimeStaticMeshContext, ESPMode::ThreadSafe> StaticMeshContext = MakeShared<FglTFRuntimeStaticMeshContext, ESPMode::ThreadSafe>(AsShared(), -1, StaticMeshConfig);
 
-	Async(EAsyncExecution::Thread, [this, StaticMeshContext, MeshIndices, AsyncCallback]()
+	Async(EAsyncExecution::Thread, [this, StaticMeshContext, MeshIndices, CombinedFingerprint, bCanUseGlobalCache, AsyncCallback, &Cache]()
 		{
 			bool bSuccess = true;
 			for (const int32 MeshIndex : MeshIndices)
@@ -1283,11 +1477,17 @@ void FglTFRuntimeParser::LoadStaticMeshLODsAsync(const TArray<int32>& MeshIndice
 				StaticMeshContext->StaticMesh = LoadStaticMesh_Internal(StaticMeshContext);
 			}
 
-			FGraphEventRef Task = FFunctionGraphTask::CreateAndDispatchWhenReady([StaticMeshContext, AsyncCallback]()
+			FGraphEventRef Task = FFunctionGraphTask::CreateAndDispatchWhenReady([StaticMeshContext, CombinedFingerprint, bCanUseGlobalCache, AsyncCallback, &Cache]()
 				{
 					if (StaticMeshContext->StaticMesh)
 					{
 						StaticMeshContext->StaticMesh = StaticMeshContext->Parser->FinalizeStaticMesh(StaticMeshContext);
+					}
+
+					if (StaticMeshContext->StaticMesh && bCanUseGlobalCache && !CombinedFingerprint.IsEmpty())
+					{
+						// Add to global cache
+						Cache->AddCachedMesh(CombinedFingerprint, StaticMeshContext->StaticMesh);
 					}
 
 					AsyncCallback.ExecuteIfBound(StaticMeshContext->StaticMesh);
@@ -1474,23 +1674,43 @@ UStaticMesh* FglTFRuntimeParser::LoadStaticMeshRecursive(const FString& NodeName
 	StaticMeshContext->LODs.Add(&CombinedLOD);
 
 	UStaticMesh* StaticMesh = LoadStaticMesh_Internal(StaticMeshContext);
-	if (!StaticMesh)
+	if (StaticMesh)
 	{
-		return nullptr;
+		if(!StaticMeshContext->IsCachedMesh)
+		{
+			StaticMesh = FinalizeStaticMesh(StaticMeshContext);
+			// Add to global cache first using binary fingerprint if available, otherwise fall back to JSON-based
+			if (StaticMesh && !StaticMeshContext->BinaryFingerprint.IsEmpty())
+			{
+				if (UglTFRuntimeCacheSubsystem* Cache = UglTFRuntimeCacheSubsystem::Get())
+				{
+					Cache->AddCachedMesh(StaticMeshContext->BinaryFingerprint, StaticMesh);
+					UE_LOG(LogGLTFRuntime, Log, TEXT("Cached static mesh with binary fingerprint: %s"), *StaticMeshContext->BinaryFingerprint);
+				}
+				else
+				{
+					UE_LOG(LogGLTFRuntime, Warning, TEXT("Unable to get UglTFRuntimeCacheSubsystem"));
+				}	
+			}
+		}
+		return StaticMesh;
 	}
-
-	return FinalizeStaticMesh(StaticMeshContext);
+	return nullptr;
 }
 
 void FglTFRuntimeParser::LoadStaticMeshRecursiveAsync(const FString& NodeName, const TArray<FString>& ExcludeNodes, const FglTFRuntimeStaticMeshAsync& AsyncCallback, const FglTFRuntimeStaticMeshConfig& StaticMeshConfig)
 {
-
 	TSharedRef<FglTFRuntimeStaticMeshContext, ESPMode::ThreadSafe> StaticMeshContext = MakeShared<FglTFRuntimeStaticMeshContext, ESPMode::ThreadSafe>(AsShared(), -1, StaticMeshConfig);
 
+	UglTFRuntimeCacheSubsystem* Cache = UglTFRuntimeCacheSubsystem::Get();
+	if(!Cache)
+	{
+		UE_LOG(LogGLTFRuntime, Warning, TEXT("Unable to get UglTFRuntimeCacheSubsystem"));
+		return;
+	}
 
-	Async(EAsyncExecution::Thread, [this, StaticMeshContext, StaticMeshConfig, ExcludeNodes, NodeName, AsyncCallback]()
+	Async(EAsyncExecution::Thread, [this, StaticMeshContext, StaticMeshConfig, ExcludeNodes, NodeName, AsyncCallback, &Cache]()
 		{
-
 			FglTFRuntimeNode Node;
 			TArray<FglTFRuntimeNode> Nodes;
 
@@ -1527,6 +1747,10 @@ void FglTFRuntimeParser::LoadStaticMeshRecursiveAsync(const FString& NodeName, c
 				}
 			}
 
+			// Generate fingerprint for recursive mesh
+			FString RecursiveFingerprint = FString::Printf(TEXT("Recursive_%s_"), NodeName.IsEmpty() ? TEXT("Scene") : *NodeName);
+			bool bCanUseGlobalCache = true;
+			
 			FglTFRuntimeMeshLOD CombinedLOD;
 
 			for (FglTFRuntimeNode& ChildNode : Nodes)
@@ -1541,7 +1765,19 @@ void FglTFRuntimeParser::LoadStaticMeshRecursiveAsync(const FString& NodeName, c
 					TSharedPtr<FJsonObject> JsonMeshObject = GetJsonObjectFromRootIndex("meshes", ChildNode.MeshIndex);
 					if (!JsonMeshObject)
 					{
+						bCanUseGlobalCache = false;
 						return;
+					}
+
+					// Add to fingerprint
+					const FString MeshFingerprint = Cache->GenerateMeshFingerprint(JsonMeshObject, StaticMeshConfig);
+					if (!MeshFingerprint.IsEmpty())
+					{
+						RecursiveFingerprint += FString::Printf(TEXT("%s_%d_"), *MeshFingerprint, ChildNode.MeshIndex);
+					}
+					else
+					{
+						bCanUseGlobalCache = false;
 					}
 
 					FglTFRuntimeMeshLOD* LOD = nullptr;
@@ -1574,15 +1810,35 @@ void FglTFRuntimeParser::LoadStaticMeshRecursiveAsync(const FString& NodeName, c
 				}
 			}
 
+			// Check global cache before building mesh
+			if (bCanUseGlobalCache && !RecursiveFingerprint.IsEmpty())
+			{
+				if (UStaticMesh* CachedMesh = Cache->GetCachedMesh(RecursiveFingerprint))
+				{
+					UE_LOG(LogGLTFRuntime, Log, TEXT("Using globally cached recursive static mesh for async load: %s"), *RecursiveFingerprint);
+					FGraphEventRef Task = FFunctionGraphTask::CreateAndDispatchWhenReady([CachedMesh, AsyncCallback]()
+						{
+							AsyncCallback.ExecuteIfBound(CachedMesh);
+						}, TStatId(), nullptr, ENamedThreads::GameThread);
+					return;
+				}
+			}
+
 			StaticMeshContext->LODs.Add(&CombinedLOD);
 
 			StaticMeshContext->StaticMesh = LoadStaticMesh_Internal(StaticMeshContext);
 
-			FGraphEventRef Task = FFunctionGraphTask::CreateAndDispatchWhenReady([StaticMeshContext, AsyncCallback]()
+			FGraphEventRef Task = FFunctionGraphTask::CreateAndDispatchWhenReady([StaticMeshContext, RecursiveFingerprint, bCanUseGlobalCache, AsyncCallback, &Cache]()
 				{
 					if (StaticMeshContext->StaticMesh)
 					{
 						StaticMeshContext->StaticMesh = StaticMeshContext->Parser->FinalizeStaticMesh(StaticMeshContext);
+					}
+
+					if (StaticMeshContext->StaticMesh && bCanUseGlobalCache && !RecursiveFingerprint.IsEmpty())
+					{
+						// Add to global cache
+						Cache->AddCachedMesh(RecursiveFingerprint, StaticMeshContext->StaticMesh);
 					}
 
 					AsyncCallback.ExecuteIfBound(StaticMeshContext->StaticMesh);
@@ -1628,7 +1884,28 @@ UStaticMesh* FglTFRuntimeParser::LoadStaticMeshFromRuntimeLODs(const TArray<FglT
 		return nullptr;
 	}
 
-	return FinalizeStaticMesh(StaticMeshContext);
+	if (StaticMesh)
+	{
+		if(!StaticMeshContext->IsCachedMesh)
+		{
+			StaticMesh = FinalizeStaticMesh(StaticMeshContext);
+			// Add to global cache first using binary fingerprint if available, otherwise fall back to JSON-based
+			if (StaticMesh && !StaticMeshContext->BinaryFingerprint.IsEmpty())
+			{
+				if (UglTFRuntimeCacheSubsystem* Cache = UglTFRuntimeCacheSubsystem::Get())
+				{
+					Cache->AddCachedMesh(StaticMeshContext->BinaryFingerprint, StaticMesh);
+					UE_LOG(LogGLTFRuntime, Log, TEXT("Cached static mesh with binary fingerprint: %s"), *StaticMeshContext->BinaryFingerprint);
+				}
+				else
+				{
+					UE_LOG(LogGLTFRuntime, Warning, TEXT("Unable to get UglTFRuntimeCacheSubsystem"));
+				}	
+			}
+		}
+		return StaticMesh;
+	}
+	return nullptr;
 }
 
 void FglTFRuntimeParser::LoadStaticMeshFromRuntimeLODsAsync(const TArray<FglTFRuntimeMeshLOD>& RuntimeLODs, const FglTFRuntimeStaticMeshAsync& AsyncCallback, const FglTFRuntimeStaticMeshConfig& StaticMeshConfig)
@@ -1650,6 +1927,25 @@ void FglTFRuntimeParser::LoadStaticMeshFromRuntimeLODsAsync(const TArray<FglTFRu
 					{
 						StaticMeshContext->StaticMesh = StaticMeshContext->Parser->FinalizeStaticMesh(StaticMeshContext);
 					}
+
+					if(!StaticMeshContext->IsCachedMesh)
+					{
+						StaticMeshContext->StaticMesh = StaticMeshContext->Parser->FinalizeStaticMesh(StaticMeshContext);
+						// Add to global cache first using binary fingerprint if available, otherwise fall back to JSON-based
+						if (StaticMeshContext->StaticMesh && !StaticMeshContext->BinaryFingerprint.IsEmpty())
+						{
+							if (UglTFRuntimeCacheSubsystem* Cache = UglTFRuntimeCacheSubsystem::Get())
+							{
+								Cache->AddCachedMesh(StaticMeshContext->BinaryFingerprint, StaticMeshContext->StaticMesh);
+								UE_LOG(LogGLTFRuntime, Log, TEXT("Cached static mesh with binary fingerprint: %s"), *StaticMeshContext->BinaryFingerprint);
+							}
+							else
+							{
+								UE_LOG(LogGLTFRuntime, Warning, TEXT("Unable to get UglTFRuntimeCacheSubsystem"));
+							}	
+						}
+					}
+		
 
 					AsyncCallback.ExecuteIfBound(StaticMeshContext->StaticMesh);
 #if (ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 2) || ENGINE_MAJOR_VERSION > 5
