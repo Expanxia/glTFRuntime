@@ -172,10 +172,3 @@ FString UglTFRuntimeCacheSubsystem::GenerateMeshFingerprint(
 	
 	return FString::Printf(TEXT("Mesh_%u"), CombinedHash);
 }
-
-UStaticMesh* UglTFRuntimeCacheSubsystem::CreateTransientStaticMesh()
-{
-    // Create a transient UStaticMesh owned by this subsystem (safe cleanup)
-    UStaticMesh* Mesh = NewObject<UStaticMesh>(this, NAME_None, RF_Transient);
-    return Mesh;
-}
