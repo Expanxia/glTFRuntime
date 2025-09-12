@@ -3,6 +3,8 @@
 #include "glTFRuntimeCacheSubsystem.h"
 #include "Engine/Texture2D.h"
 #include "Engine/StaticMesh.h"
+#include "HttpModule.h"
+#include "Interfaces/IHttpResponse.h"
 
 UglTFRuntimeCacheSubsystem* UglTFRuntimeCacheSubsystem::Get()
 {
@@ -171,4 +173,270 @@ FString UglTFRuntimeCacheSubsystem::GenerateMeshFingerprint(
 	const uint32 CombinedHash = HashCombine(JsonHash, ConfigHash);
 	
 	return FString::Printf(TEXT("Mesh_%u"), CombinedHash);
+}
+
+void UglTFRuntimeCacheSubsystem::DownloadExternalFiles(
+    const FString& BaseUrl,
+    const FString& CachePath,
+    const TArray<FString>& Uris,
+    TFunction<void(const TArray<FPendingDownload>&)> OnAllComplete,
+    bool bUseCacheOnError)
+{
+    TSharedRef<TArray<FPendingDownload>> Pending = MakeShared<TArray<FPendingDownload>>();
+    Pending->Reserve(Uris.Num());
+
+    TSharedRef<int32> Remaining = MakeShared<int32>(Uris.Num());
+
+    for (const FString& Uri : Uris)
+    {
+        FString CacheFilename = CachePath / FPaths::GetCleanFilename(Uri);
+        FString FullUrl = FPaths::Combine(BaseUrl, Uri);
+
+        // If an active download exists, attach callback and continue
+        if (ActiveDownloads.Contains(CacheFilename))
+        {
+            ActiveDownloads[CacheFilename].Callbacks.Add(
+                [Pending, Remaining, OnAllComplete](const FPendingDownload& Result)
+                {
+                    Pending->Add(Result);
+                    (*Remaining)--;
+                    if (*Remaining == 0)
+                    {
+                        OnAllComplete(*Pending);
+                    }
+                });
+            continue;
+        }
+
+        // If already queued, attach callback to the queued entry in ActiveDownloads (we create the entry now)
+        if (PendingSet.Contains(CacheFilename))
+        {
+            // ActiveDownloads should contain an entry even for queued items � ensure it does
+            if (ActiveDownloads.Contains(CacheFilename))
+            {
+                ActiveDownloads[CacheFilename].Callbacks.Add(
+                    [Pending, Remaining, OnAllComplete](const FPendingDownload& Result)
+                    {
+                        Pending->Add(Result);
+                        (*Remaining)--;
+                        if (*Remaining == 0)
+                        {
+                            OnAllComplete(*Pending);
+                        }
+                    });
+                continue;
+            }
+            else
+            {
+                // This should not normally happen, but log to help debug
+                UE_LOG(LogTemp, Warning, TEXT("PendingSet contains %s but ActiveDownloads has no entry"), *CacheFilename);
+            }
+        }
+
+        // Create an ActiveDownloads entry immediately (prepares callback list). This prevents duplicates from being queued.
+        FPendingDownloadTask NewTask;
+        NewTask.Url = FullUrl;
+        NewTask.CacheFilename = CacheFilename;
+        NewTask.Callbacks.Add(
+            [Pending, Remaining, OnAllComplete](const FPendingDownload& Result)
+            {
+                Pending->Add(Result);
+                (*Remaining)--;
+                if (*Remaining == 0)
+                {
+                    OnAllComplete(*Pending);
+                }
+            });
+
+        ActiveDownloads.Add(CacheFilename, MoveTemp(NewTask));
+
+        // Enqueue key and mark as pending
+        PendingQueue.Enqueue(CacheFilename);
+        PendingSet.Add(CacheFilename);
+    }
+
+    // Try to pump the queue
+    PumpQueue(bUseCacheOnError);
+}
+
+void UglTFRuntimeCacheSubsystem::PumpQueue(bool bUseCacheOnError)
+{
+    // Debug log
+    UE_LOG(LogTemp, Verbose, TEXT("PumpQueue called. Active=%d, Pending=%d, CurrentActive=%d"),
+        ActiveDownloads.Num(), PendingSet.Num(), CurrentActiveRequests);
+
+    // Start as many as allowed
+    while (CurrentActiveRequests < MaxConcurrentRequests)
+    {
+        FString CacheFilename;
+        if (!PendingQueue.Dequeue(CacheFilename))
+        {
+            break;
+        }
+
+        // Remove from pending set because it's being started now
+        PendingSet.Remove(CacheFilename);
+
+        // Ensure the ActiveDownloads entry exists
+        FPendingDownloadTask* TaskPtr = ActiveDownloads.Find(CacheFilename);
+        if (!TaskPtr)
+        {
+            UE_LOG(LogTemp, Warning, TEXT("PumpQueue: no ActiveDownloads entry for %s"), *CacheFilename);
+            continue;
+        }
+
+        // Start the request using the map-owned task (so we don't operate on temporaries)
+        StartRequest(*TaskPtr, bUseCacheOnError);
+    }
+}
+
+void UglTFRuntimeCacheSubsystem::StartRequest(FPendingDownloadTask& Task, bool bUseCacheOnError)
+{
+    // guard
+    if (Task.HttpRequest.IsValid())
+    {
+        UE_LOG(LogTemp, Warning, TEXT("StartRequest called but HttpRequest already exists for %s"), *Task.CacheFilename);
+        return;
+    }
+
+    CurrentActiveRequests++;
+
+    TSharedRef<IHttpRequest, ESPMode::ThreadSafe> Request = FHttpModule::Get().CreateRequest();
+    Task.HttpRequest = Request; // store into the map-held task
+
+    Request->SetVerb(TEXT("GET"));
+    Request->SetURL(Task.Url);
+    UE_LOG(LogTemp, Warning, TEXT("REQUESTING: %s -> %s"), *Task.Url, *Task.CacheFilename);
+
+    if (FPaths::FileExists(Task.CacheFilename))
+    {
+        const FDateTime CacheModificationTime = IFileManager::Get().GetTimeStamp(*Task.CacheFilename);
+        Request->AppendToHeader(TEXT("If-Modified-Since"), CacheModificationTime.ToHttpDate());
+    }
+
+    // capture CacheFilename by value to find the map entry on completion
+    Request->OnProcessRequestComplete().BindLambda(
+        [this, CacheFilename = Task.CacheFilename, bUseCacheOnError]
+        (FHttpRequestPtr Req, FHttpResponsePtr Resp, bool bSuccess)
+        {
+            // We�re on the game thread here. Copy out safe data.
+            const bool bValidResp = (bSuccess && Resp.IsValid());
+            const int32 RespCode = bValidResp ? Resp->GetResponseCode() : -1;
+            const TArray<uint8> ResponseData = bValidResp ? Resp->GetContent() : TArray<uint8>();
+            const FString LastModified = bValidResp ? Resp->GetHeader(TEXT("Last-Modified")) : FString();
+            const bool bCacheValid = FPaths::FileExists(CacheFilename);
+
+            // Do heavy work async
+            Async(EAsyncExecution::ThreadPool, [this, CacheFilename, ResponseData, LastModified, RespCode, bValidResp, bCacheValid, bUseCacheOnError]()
+                {
+                    FPendingDownload Result;
+                    Result.Uri = CacheFilename;
+                    Result.CacheFilename = CacheFilename;
+                    Result.bSuccess = false;
+
+                    if (bValidResp)
+                    {
+                        if (RespCode == 200)
+                        {
+                            // Save file
+                            IFileManager::Get().MakeDirectory(*FPaths::GetPath(CacheFilename), true);
+                            if (FFileHelper::SaveArrayToFile(ResponseData, *CacheFilename))
+                            {
+                                Result.bSuccess = true;
+
+                                // Set timestamp if server provided one
+                                FDateTime ServerTime;
+                                if (FDateTime::ParseHttpDate(LastModified, ServerTime))
+                                {
+                                    FPlatformFileManager::Get().GetPlatformFile().SetTimeStamp(*CacheFilename, ServerTime);
+                                }
+                                UE_LOG(LogTemp, Warning, TEXT("WRITING CACHE: %s"), *CacheFilename);
+                            }
+                        }
+                        else if (RespCode == 304 && bCacheValid)
+                        {
+                            Result.bSuccess = true;
+                            UE_LOG(LogTemp, Warning, TEXT("Loading %s from cache (304)"), *CacheFilename);
+                        }
+                    }
+                    else if (bCacheValid && bUseCacheOnError)
+                    {
+                        Result.bSuccess = true;
+                        UE_LOG(LogTemp, Warning, TEXT("Network error, falling back to cache: %s"), *CacheFilename);
+                    }
+
+                    // Bounce back to game thread for callbacks + state cleanup
+                    AsyncTask(ENamedThreads::GameThread, [this, CacheFilename, Result, bUseCacheOnError]()
+                        {
+                            if (FPendingDownloadTask* FinishedTask = ActiveDownloads.Find(CacheFilename))
+                            {
+                                // Copy callbacks before removal
+                                TArray<TFunction<void(const FPendingDownload&)>> Callbacks = FinishedTask->Callbacks;
+
+                                // Remove before calling
+                                ActiveDownloads.Remove(CacheFilename);
+                                CurrentActiveRequests = FMath::Max(0, CurrentActiveRequests - 1);
+
+                                for (auto& Callback : Callbacks)
+                                {
+                                    Callback(Result);
+                                }
+                            }
+                            else
+                            {
+                                CurrentActiveRequests = FMath::Max(0, CurrentActiveRequests - 1);
+                                UE_LOG(LogTemp, Warning, TEXT("StartRequest completion: no ActiveDownloads entry for %s"), *CacheFilename);
+                            }
+
+                            // Pump next queued requests
+                            PumpQueue(bUseCacheOnError);
+                        });
+                });
+        });
+
+
+    Request->ProcessRequest();
+}
+
+TArray<FString> UglTFRuntimeCacheSubsystem::GetExternalUris(const TSharedPtr<FJsonObject>& GltfJson)
+{
+	TArray<FString> ExternalUris;
+
+	// Buffers
+	const TArray<TSharedPtr<FJsonValue>>* Buffers;
+	if (GltfJson->TryGetArrayField(TEXT("buffers"), Buffers))
+	{
+		for (const TSharedPtr<FJsonValue>& BufferVal : *Buffers)
+		{
+			const TSharedPtr<FJsonObject>* BufferObj;
+			if (BufferVal->TryGetObject(BufferObj))
+			{
+				FString Uri;
+				if ((*BufferObj)->TryGetStringField(TEXT("uri"), Uri))
+				{
+					ExternalUris.Add(Uri);
+				}
+			}
+		}
+	}
+
+	// Images
+	const TArray<TSharedPtr<FJsonValue>>* Images;
+	if (GltfJson->TryGetArrayField(TEXT("images"), Images))
+	{
+		for (const TSharedPtr<FJsonValue>& ImageVal : *Images)
+		{
+			const TSharedPtr<FJsonObject>* ImageObj;
+			if (ImageVal->TryGetObject(ImageObj))
+			{
+				FString Uri;
+				if ((*ImageObj)->TryGetStringField(TEXT("uri"), Uri))
+				{
+					ExternalUris.Add(Uri);
+				}
+			}
+		}
+	}
+
+	return ExternalUris;
 }

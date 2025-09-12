@@ -45,6 +45,9 @@ public:
 	UFUNCTION(BlueprintCallable, meta = (DisplayName = "glTF Load Asset from Url with Cache", AutoCreateRefTerm = "LoaderConfig, Headers"), Category = "glTFRuntime")
 	static void glTFLoadAssetFromUrlWithCache(const FString& Url, const FString& CacheFilename, const TMap<FString, FString>& Headers, const bool bUseCacheOnError, const FglTFRuntimeHttpResponse& Completed, const FglTFRuntimeConfig& LoaderConfig);
 
+	UFUNCTION(BlueprintCallable, meta = (WorldContext = "WorldContextObject", DisplayName = "glTF Load Asset from Url with External files", AutoCreateRefTerm = "LoaderConfig, Headers"), Category = "glTFRuntime")
+	static void glTFLoadAssetFromUrlWithExternalFiles(UObject* WorldContextObject, const FString& Url, const FString& CacheDirectory, const TMap<FString, FString>& Headers, const bool bUseCacheOnError, const FglTFRuntimeHttpResponse& Completed, const FglTFRuntimeConfig& LoaderConfig);
+	
 	UFUNCTION(BlueprintCallable, meta = (DisplayName = "glTF Load Asset from Url with Progress", AutoCreateRefTerm = "LoaderConfig, Headers"), Category = "glTFRuntime")
 	static void glTFLoadAssetFromUrlWithProgress(const FString& Url, const TMap<FString, FString>& Headers, FglTFRuntimeHttpResponse Completed, FglTFRuntimeHttpProgress Progress, const FglTFRuntimeConfig& LoaderConfig);
 

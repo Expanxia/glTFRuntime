@@ -2,6 +2,7 @@
 
 
 #include "glTFRuntimeFunctionLibrary.h"
+#include "glTFRuntimeCacheSubsystem.h"
 #include "Animation/AnimSequence.h"
 #include "Async/Async.h"
 #include "HttpModule.h"
@@ -425,6 +426,155 @@ void UglTFRuntimeFunctionLibrary::glTFLoadAssetFromUrlWithCache(const FString& U
 			}
 			Completed.ExecuteIfBound(Asset);
 		}, Completed, LoaderConfig, CacheFilename);
+
+	HttpRequest->ProcessRequest();
+}
+
+void UglTFRuntimeFunctionLibrary::glTFLoadAssetFromUrlWithExternalFiles(UObject* WorldContextObject, const FString& Url, const FString& CacheDirectory, const TMap<FString, FString>& Headers, const bool bUseCacheOnError, const FglTFRuntimeHttpResponse& Completed, const FglTFRuntimeConfig& LoaderConfig)
+{
+#if ENGINE_MAJOR_VERSION > 4 || ENGINE_MINOR_VERSION > 25
+	TSharedRef<IHttpRequest, ESPMode::ThreadSafe> HttpRequest = FHttpModule::Get().CreateRequest();
+#else
+	TSharedRef<IHttpRequest> HttpRequest = FHttpModule::Get().CreateRequest();
+#endif
+
+	HttpRequest->SetURL(Url);
+	FString CacheFilename = CacheDirectory / FPaths::GetCleanFilename(Url);
+	bool bCacheFileValid = false;
+
+	if (!CacheFilename.IsEmpty() && FPaths::FileExists(CacheFilename))
+	{
+		const FDateTime ModificationTime = IFileManager::Get().GetTimeStamp(*CacheFilename);
+		HttpRequest->AppendToHeader("If-Modified-Since", ModificationTime.ToHttpDate());
+		bCacheFileValid = true;
+	}
+
+	for (TPair<FString, FString> Header : Headers)
+	{
+		HttpRequest->AppendToHeader(Header.Key, Header.Value);
+	}
+
+	float StartTime = FPlatformTime::Seconds();
+
+	HttpRequest->OnProcessRequestComplete().BindLambda(
+		[StartTime, bCacheFileValid, bUseCacheOnError, Url, CacheDirectory, Completed, LoaderConfig, CacheFilename]
+		(FHttpRequestPtr RequestPtr, FHttpResponsePtr ResponsePtr, bool bSuccess)
+		{
+			// We’re on game thread right now.
+			if (IsGarbageCollecting())
+			{
+				Completed.ExecuteIfBound(nullptr);
+				return;
+			}
+
+			// Copy data out for async (safe types only)
+			const bool bValidResp = (bSuccess && ResponsePtr.IsValid());
+			const int32 RespCode = bValidResp ? ResponsePtr->GetResponseCode() : -1;
+			const TArray<uint8> ResponseData = bValidResp ? ResponsePtr->GetContent() : TArray<uint8>();
+			const FString LastModified = bValidResp ? ResponsePtr->GetHeader(TEXT("Last-Modified")) : FString();
+
+			// Offload heavy work
+			Async(EAsyncExecution::ThreadPool, [=]() mutable
+				{
+					UglTFRuntimeAsset* Asset = nullptr;
+
+					if (bValidResp)
+					{
+						if (RespCode == 304 && bCacheFileValid)
+						{
+							UE_LOG(LogGLTFRuntime, Warning, TEXT("Loading %s from cache"), *CacheFilename);
+							Asset = glTFLoadAssetFromFilename(CacheFilename, false, LoaderConfig);
+						}
+						else if (RespCode == 200)
+						{
+							if (!CacheFilename.IsEmpty())
+							{
+								FFileHelper::SaveArrayToFile(ResponseData, *CacheFilename);
+
+								FDateTime ServerTime;
+								if (FDateTime::ParseHttpDate(LastModified, ServerTime))
+								{
+									UE_LOG(LogTemp, Log, TEXT("Server Last-Modified = %s"), *ServerTime.ToString());
+									IPlatformFile& PlatformFile = FPlatformFileManager::Get().GetPlatformFile();
+									PlatformFile.SetTimeStamp(*CacheFilename, ServerTime);
+								}
+							}
+							Asset = glTFLoadAssetFromData(ResponseData, LoaderConfig);
+						}
+					}
+					else if (bCacheFileValid && bUseCacheOnError)
+					{
+						Asset = glTFLoadAssetFromFilename(CacheFilename, false, LoaderConfig);
+					}
+
+					// Back to game thread for UObject + BP callback usage
+					AsyncTask(ENamedThreads::GameThread, [=]()
+						{
+							if (!Asset)
+							{
+								Completed.ExecuteIfBound(nullptr);
+								return;
+							}
+
+							Asset->GetParser()->SetDownloadTime(FPlatformTime::Seconds() - StartTime);
+							Asset->GetParser()->SetBaseDirectory(CacheDirectory);
+
+							TArray<FString> URIs = UglTFRuntimeCacheSubsystem::GetExternalUris(Asset->GetParser()->GetJsonRoot());
+							if (!URIs.IsEmpty())
+							{
+								FString BaseUrl = Url;
+								int32 LastSlashIndex;
+								if (Url.FindLastChar('/', LastSlashIndex))
+								{
+									BaseUrl = Url.Left(LastSlashIndex + 1);
+								}
+
+								TStrongObjectPtr<UglTFRuntimeAsset> StrongAsset(Asset);
+
+								if (UglTFRuntimeCacheSubsystem* Cache = UglTFRuntimeCacheSubsystem::Get())
+								{
+									Cache->DownloadExternalFiles(
+										BaseUrl,
+										CacheDirectory,
+										URIs,
+										[Completed, StrongAsset](const TArray<FPendingDownload>& Results)
+										{
+											TArray<FString> SuccessfulUris;
+											for (const auto& R : Results)
+											{
+												if (!R.bSuccess)
+												{
+													UE_LOG(LogGLTFRuntime, Error, TEXT("Failed to download: %s"), *R.Uri);
+													Completed.ExecuteIfBound(nullptr);
+													return;
+												}
+												SuccessfulUris.Add(R.Uri);
+											}
+
+											if (SuccessfulUris.Num() > 0)
+											{
+												UE_LOG(LogGLTFRuntime, Log, TEXT("Successfully downloaded: %s"),
+													*FString::Join(SuccessfulUris, TEXT(", ")));
+											}
+
+											Completed.ExecuteIfBound(StrongAsset.Get());
+										},
+										bUseCacheOnError);
+								}
+								else
+								{
+									UE_LOG(LogGLTFRuntime, Warning, TEXT("Unable to get UglTFRuntimeCacheSubsystem"));
+									Completed.ExecuteIfBound(Asset);
+								}
+							}
+							else
+							{
+								UE_LOG(LogGLTFRuntime, Warning, TEXT("No external files to download."));
+								Completed.ExecuteIfBound(Asset);
+							}
+						});
+				});
+		});
 
 	HttpRequest->ProcessRequest();
 }
