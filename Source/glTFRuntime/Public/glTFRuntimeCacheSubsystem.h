@@ -87,4 +87,5 @@ private:
   TSet<FString> PendingSet;
 
   int32 CurrentActiveRequests = 0;
+  std::atomic<bool> bShuttingDown = false;
 };

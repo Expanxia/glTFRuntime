@@ -28,10 +28,12 @@ void UglTFRuntimeCacheSubsystem::Initialize(FSubsystemCollectionBase& Collection
 {
     Super::Initialize(Collection);
     UE_LOG(LogTemp, Log, TEXT("glTFRuntime Cache Subsystem Initialized"));
+    bShuttingDown.store(false);
 }
 
 void UglTFRuntimeCacheSubsystem::Deinitialize()
 {
+    bShuttingDown.store(true);
     FGraphEventRef Task = FFunctionGraphTask::CreateAndDispatchWhenReady([this]()
         {
             ClearMeshCache(); 
@@ -94,7 +96,7 @@ UStaticMesh* UglTFRuntimeCacheSubsystem::GetCachedMesh(const FString& MeshFinger
 
 void UglTFRuntimeCacheSubsystem::AddCachedMesh(const FString& MeshFingerprint, UStaticMesh* Mesh)
 {
-    if (Mesh && !MeshFingerprint.IsEmpty())
+    if (!bShuttingDown.load() && Mesh && !MeshFingerprint.IsEmpty())
 	{
 		FScopeLock Lock(&MeshCacheLock);
         MeshCache.Add(MeshFingerprint, Mesh);
@@ -182,6 +184,11 @@ void UglTFRuntimeCacheSubsystem::DownloadExternalFiles(
     TFunction<void(const TArray<FPendingDownload>&)> OnAllComplete,
     bool bUseCacheOnError)
 {
+    if (bShuttingDown.load())
+    {
+        return;
+    }
+
     TSharedRef<TArray<FPendingDownload>> Pending = MakeShared<TArray<FPendingDownload>>();
     Pending->Reserve(Uris.Num());
 
@@ -261,12 +268,17 @@ void UglTFRuntimeCacheSubsystem::DownloadExternalFiles(
 
 void UglTFRuntimeCacheSubsystem::PumpQueue(bool bUseCacheOnError)
 {
+    if (bShuttingDown.load())
+    {
+        return;
+    }
+
     // Debug log
     UE_LOG(LogTemp, Verbose, TEXT("PumpQueue called. Active=%d, Pending=%d, CurrentActive=%d"),
         ActiveDownloads.Num(), PendingSet.Num(), CurrentActiveRequests);
 
     // Start as many as allowed
-    while (CurrentActiveRequests < MaxConcurrentRequests)
+    while (!bShuttingDown.load() && CurrentActiveRequests < MaxConcurrentRequests)
     {
         FString CacheFilename;
         if (!PendingQueue.Dequeue(CacheFilename))
@@ -293,6 +305,12 @@ void UglTFRuntimeCacheSubsystem::PumpQueue(bool bUseCacheOnError)
 void UglTFRuntimeCacheSubsystem::StartRequest(FPendingDownloadTask& Task, bool bUseCacheOnError)
 {
     // guard
+    if (bShuttingDown.load())
+    {
+        UE_LOG(LogTemp, Warning, TEXT("StartRequest called but subsystem is shutting down. %s"), *Task.CacheFilename);
+        return;
+    }
+
     if (Task.HttpRequest.IsValid())
     {
         UE_LOG(LogTemp, Warning, TEXT("StartRequest called but HttpRequest already exists for %s"), *Task.CacheFilename);
